@@ -28,6 +28,15 @@ pub fn single_link_config() -> FieldModelConfig {
     }
 }
 
+/// Create a FieldModelConfig with the given number of links (nodes).
+/// Falls back to single-link when n_links < 1.
+pub fn multi_link_config(n_links: usize) -> FieldModelConfig {
+    FieldModelConfig {
+        n_links: n_links.max(1),
+        ..FieldModelConfig::default()
+    }
+}
+
 /// Estimate occupancy using the FieldModel when calibrated, falling back
 /// to the score-based heuristic otherwise.
 ///
@@ -81,6 +90,49 @@ pub fn occupancy_or_fallback(
     }
 }
 
+/// Multi-node variant: collect latest frames from all active nodes and feed
+/// them as a multi-link observation to the FieldModel.
+pub fn occupancy_or_fallback_multi(
+    field: &FieldModel,
+    node_histories: &[&VecDeque<Vec<f64>>],
+    smoothed_score: f64,
+    prev_count: usize,
+) -> usize {
+    if node_histories.is_empty() {
+        return score_to_person_count(smoothed_score, prev_count);
+    }
+    // Single node: delegate to original path.
+    if node_histories.len() == 1 {
+        return occupancy_or_fallback(field, node_histories[0], smoothed_score, prev_count);
+    }
+    match field.status() {
+        CalibrationStatus::Fresh | CalibrationStatus::Stale => {
+            // Build multi-link observation: one sub-array per node (latest frame).
+            let observation: Vec<Vec<f64>> = node_histories.iter()
+                .filter_map(|h| h.back().cloned())
+                .collect();
+            if observation.is_empty() {
+                return score_to_person_count(smoothed_score, prev_count);
+            }
+            match field.extract_perturbation(&observation) {
+                Ok(perturbation) => {
+                    if perturbation.total_energy > ENERGY_THRESH_3 {
+                        3
+                    } else if perturbation.total_energy > ENERGY_THRESH_2 {
+                        2
+                    } else if perturbation.total_energy > 1.0 {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                Err(_) => score_to_person_count(smoothed_score, prev_count),
+            }
+        }
+        _ => score_to_person_count(smoothed_score, prev_count),
+    }
+}
+
 /// Feed the latest frame to the FieldModel during calibration collection.
 ///
 /// Only acts when the model status is `Collecting`. Wraps the latest frame
@@ -95,6 +147,23 @@ pub fn maybe_feed_calibration(field: &mut FieldModel, frame_history: &VecDeque<V
         if let Err(e) = field.feed_calibration(&observations) {
             tracing::debug!("FieldModel calibration feed: {e}");
         }
+    }
+}
+
+/// Multi-node variant: feed calibration with observations from all active nodes.
+/// Each node contributes one sub-array (its latest frame) to form a multi-link observation.
+pub fn maybe_feed_calibration_multi(field: &mut FieldModel, node_histories: &[&VecDeque<Vec<f64>>]) {
+    if field.status() != CalibrationStatus::Collecting {
+        return;
+    }
+    let observations: Vec<Vec<f64>> = node_histories.iter()
+        .filter_map(|h| h.back().cloned())
+        .collect();
+    if observations.is_empty() {
+        return;
+    }
+    if let Err(e) = field.feed_calibration(&observations) {
+        tracing::debug!("FieldModel multi-node calibration feed: {e}");
     }
 }
 

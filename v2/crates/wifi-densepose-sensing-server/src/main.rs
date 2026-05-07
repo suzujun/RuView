@@ -3384,12 +3384,13 @@ async fn calibration_start(State(state): State<SharedState>) -> Json<serde_json:
             _ => {} // Stale/Expired/Uncalibrated — ok to recalibrate
         }
     }
-    match FieldModel::new(field_bridge::single_link_config()) {
+    let n_links = s.multistatic_fuser.node_positions().len().max(1);
+    match FieldModel::new(field_bridge::multi_link_config(n_links)) {
         Ok(fm) => {
             s.field_model = Some(fm);
             Json(serde_json::json!({
                 "success": true,
-                "message": "Calibration started — keep room empty while frames accumulate.",
+                "message": format!("Calibration started (n_links={n_links}) — keep room empty while frames accumulate."),
             }))
         }
         Err(e) => Json(serde_json::json!({
@@ -3729,22 +3730,35 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         0
                     };
 
-                    // Feed field model calibration if active (use per-node history for ESP32).
-                    if let Some(frame_history) = s.node_states.get(&node_id).map(|ns| ns.frame_history.clone()) {
-                        if let Some(ref mut fm) = s.field_model {
-                            field_bridge::maybe_feed_calibration(fm, &frame_history);
+                    // Feed field model calibration if active (multi-node).
+                    // Clone latest frames first to avoid borrow conflict with field_model.
+                    let cal_frames: Vec<Vec<f64>> = s.node_states.values()
+                        .filter(|ns| ns.last_frame_time.map_or(false, |t| now.duration_since(t).as_secs() < 10))
+                        .filter_map(|ns| ns.frame_history.back().cloned())
+                        .collect();
+                    if let Some(ref mut fm) = s.field_model {
+                        if fm.status() == CalibrationStatus::Collecting && !cal_frames.is_empty() {
+                            if let Err(e) = fm.feed_calibration(&cal_frames) {
+                                tracing::debug!("FieldModel multi-node calibration feed: {e}");
+                            }
                         }
                     }
 
                     // Build nodes array with all active nodes.
+                    let node_positions = s.multistatic_fuser.node_positions();
                     let active_nodes: Vec<NodeInfo> = s.node_states.iter()
                         .filter(|(_, n)| n.last_frame_time.map_or(false, |t| now.duration_since(t).as_secs() < 10))
-                        .map(|(&id, n)| NodeInfo {
-                            node_id: id,
-                            rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
-                            position: [2.0, 0.0, 1.5],
-                            amplitude: vec![],
-                            subcarrier_count: 0,
+                        .map(|(&id, n)| {
+                            let pos = node_positions.get(id as usize)
+                                .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+                                .unwrap_or([0.0, 0.0, 0.0]);
+                            NodeInfo {
+                                node_id: id,
+                                rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
+                                position: pos,
+                                amplitude: vec![],
+                                subcarrier_count: 0,
+                            }
                         })
                         .collect();
 
@@ -3991,24 +4005,36 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         0
                     };
 
-                    // Feed field model calibration if active (use per-node history for ESP32).
-                    if let Some(frame_history) = s.node_states.get(&node_id).map(|ns| ns.frame_history.clone()) {
-                        if let Some(ref mut fm) = s.field_model {
-                            field_bridge::maybe_feed_calibration(fm, &frame_history);
+                    // Feed field model calibration if active (multi-node).
+                    let cal_frames: Vec<Vec<f64>> = s.node_states.values()
+                        .filter(|ns| ns.last_frame_time.map_or(false, |t| now.duration_since(t).as_secs() < 10))
+                        .filter_map(|ns| ns.frame_history.back().cloned())
+                        .collect();
+                    if let Some(ref mut fm) = s.field_model {
+                        if fm.status() == CalibrationStatus::Collecting && !cal_frames.is_empty() {
+                            if let Err(e) = fm.feed_calibration(&cal_frames) {
+                                tracing::debug!("FieldModel multi-node calibration feed: {e}");
+                            }
                         }
                     }
 
                     // Build nodes array with all active nodes.
+                    let node_positions = s.multistatic_fuser.node_positions();
                     let active_nodes: Vec<NodeInfo> = s.node_states.iter()
                         .filter(|(_, n)| n.last_frame_time.map_or(false, |t| now.duration_since(t).as_secs() < 10))
-                        .map(|(&id, n)| NodeInfo {
-                            node_id: id,
-                            rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
-                            position: [2.0, 0.0, 1.5],
-                            amplitude: n.frame_history.back()
-                                .map(|a| a.iter().take(56).cloned().collect())
-                                .unwrap_or_default(),
-                            subcarrier_count: n.frame_history.back().map_or(0, |a| a.len()),
+                        .map(|(&id, n)| {
+                            let pos = node_positions.get(id as usize)
+                                .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+                                .unwrap_or([0.0, 0.0, 0.0]);
+                            NodeInfo {
+                                node_id: id,
+                                rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
+                                position: pos,
+                                amplitude: n.frame_history.back()
+                                    .map(|a| a.iter().take(56).cloned().collect())
+                                    .unwrap_or_default(),
+                                subcarrier_count: n.frame_history.back().map_or(0, |a| a.len()),
+                            }
                         })
                         .collect();
 
@@ -4836,8 +4862,12 @@ async fn main() {
             fuser
         },
         field_model: if args.calibrate {
-            info!("Field model calibration enabled — room should be empty during startup");
-            FieldModel::new(field_bridge::single_link_config()).ok()
+            let n_links = args.node_positions.as_ref()
+                .map(|s| field_bridge::parse_node_positions(s).len())
+                .unwrap_or(1)
+                .max(1);
+            info!("Field model calibration enabled (n_links={n_links}) — room should be empty during startup");
+            FieldModel::new(field_bridge::multi_link_config(n_links)).ok()
         } else {
             None
         },
