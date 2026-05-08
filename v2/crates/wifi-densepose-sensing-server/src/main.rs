@@ -3843,9 +3843,8 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         update.persons = Some(tracked);
                     }
 
-                    if let Ok(json) = serde_json::to_string(&update) {
-                        let _ = s.tx.send(json);
-                    }
+                    // Don't broadcast here — broadcast_tick_task handles
+                    // fused updates at a stable tick rate to prevent flicker.
                     s.latest_update = Some(update);
                     s.edge_vitals = Some(vitals);
                     continue;
@@ -4079,9 +4078,8 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         update.persons = Some(tracked);
                     }
 
-                    if let Ok(json) = serde_json::to_string(&update) {
-                        let _ = s.tx.send(json);
-                    }
+                    // Don't broadcast here — broadcast_tick_task handles
+                    // fused updates at a stable tick rate to prevent flicker.
                     s.latest_update = Some(update);
 
                     // Evict stale nodes every 100 ticks to prevent memory leak.
@@ -4235,13 +4233,16 @@ async fn broadcast_tick_task(state: SharedState, tick_ms: u64) {
     loop {
         interval.tick().await;
         let s = state.read().await;
+        if s.tx.receiver_count() == 0 {
+            continue;
+        }
+        // Re-broadcast the latest fused sensing_update at a stable tick rate.
+        // The UDP receiver updates per-node state and builds latest_update,
+        // but does NOT broadcast — this task is the sole broadcaster, ensuring
+        // UI clients get a stable ~10fps stream with all nodes fused.
         if let Some(ref update) = s.latest_update {
-            if s.tx.receiver_count() > 0 {
-                // Re-broadcast the latest sensing_update so pose WS clients
-                // always get data even when ESP32 pauses between frames.
-                if let Ok(json) = serde_json::to_string(update) {
-                    let _ = s.tx.send(json);
-                }
+            if let Ok(json) = serde_json::to_string(update) {
+                let _ = s.tx.send(json);
             }
         }
     }
