@@ -3,7 +3,7 @@
 # Multi-stage build for minimal final image
 
 # Stage 1: Build
-FROM rust:1.87-bookworm AS builder
+FROM rustlang/rust:nightly-bookworm AS builder
 
 WORKDIR /build
 
@@ -14,7 +14,7 @@ COPY v2/crates/ ./crates/
 # Copy vendored RuVector crates
 COPY vendor/ruvector/ /build/vendor/ruvector/
 
-# Build release binary
+# Build release binary (nightly required for ruvector-core AVX-512 intrinsics)
 RUN cargo build --release -p wifi-densepose-sensing-server 2>&1 \
     && strip target/release/sensing-server
 
