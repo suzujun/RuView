@@ -458,23 +458,33 @@ impl AppStateInner {
     }
 
     /// Person count: eigenvalue-based if field model is calibrated, else heuristic.
+    /// Uses multi-node observations when multiple nodes are active.
     pub fn person_count(&self) -> usize {
         use crate::field_bridge;
         use crate::csi::score_to_person_count;
         match self.field_model.as_ref() {
             Some(fm) => {
-                let history = if !self.frame_history.is_empty() {
-                    &self.frame_history
+                // Collect frame histories from all active nodes.
+                let active_histories: Vec<&VecDeque<Vec<f64>>> = self.node_states.values()
+                    .filter(|ns| ns.last_frame_time.map_or(false, |t| t.elapsed().as_secs() < 10))
+                    .filter(|ns| !ns.frame_history.is_empty())
+                    .map(|ns| &ns.frame_history)
+                    .collect();
+
+                if active_histories.len() > 1 {
+                    field_bridge::occupancy_or_fallback_multi(
+                        fm, &active_histories, self.smoothed_person_score, self.prev_person_count,
+                    )
                 } else {
-                    self.node_states.values()
-                        .filter(|ns| !ns.frame_history.is_empty())
-                        .max_by_key(|ns| ns.last_frame_time)
-                        .map(|ns| &ns.frame_history)
-                        .unwrap_or(&self.frame_history)
-                };
-                field_bridge::occupancy_or_fallback(
-                    fm, history, self.smoothed_person_score, self.prev_person_count,
-                )
+                    let history = if !self.frame_history.is_empty() {
+                        &self.frame_history
+                    } else {
+                        active_histories.first().copied().unwrap_or(&self.frame_history)
+                    };
+                    field_bridge::occupancy_or_fallback(
+                        fm, history, self.smoothed_person_score, self.prev_person_count,
+                    )
+                }
             }
             None => score_to_person_count(self.smoothed_person_score, self.prev_person_count),
         }

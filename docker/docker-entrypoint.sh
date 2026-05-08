@@ -29,4 +29,8 @@ if [ "${1#-}" != "$1" ] || [ -z "$1" ]; then
         "$@"
 fi
 
+# Forward node positions if set (env var is also read by clap via #[arg(env)])
+# but explicit forwarding ensures it works regardless of shell inheritance.
+export SENSING_NODE_POSITIONS="${SENSING_NODE_POSITIONS:-}"
+
 exec "$@"
